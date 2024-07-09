@@ -60,6 +60,7 @@ Common utlity functions and useful graph algorithms
 """
 from typing import List
 import onnx_graphsurgeon as gs
+import onnx
 
 def find_in_layers (curr_layer: gs.Node) -> List[gs.Node]:
     """
@@ -176,3 +177,12 @@ def bordered(text):
         res.append('│' + (s + ' ' * width)[:width] + '│')
     res.append('└' + '─' * width + '┘')
     return '\n'.join(res)
+
+def reset_shape_inference(onnx_graph:onnx.GraphProto):
+    '''
+    Clear all value_info entries that hold shape inference information
+    '''
+    while len(onnx_graph.value_info) > 0: 
+        onnx_graph.value_info.pop()
+    return onnx_graph
+
