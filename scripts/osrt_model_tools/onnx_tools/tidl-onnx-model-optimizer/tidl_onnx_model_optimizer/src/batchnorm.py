@@ -56,8 +56,9 @@
 # OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED
 # OF THE POSSIBILITY OF SUCH DAMAGE.
 """
-Module containing Resize layer specific functions and optimizations
+Module containing Batchnorm specific functions and optimizations
 """
+
 
 import logging
 import onnx_graphsurgeon as gs
@@ -65,40 +66,49 @@ import onnx
 import numpy as np
 
 
-def tidl_convert_resize_params_size_to_scale(graph: gs.Graph,
-                                             onnx_graph: onnx.GraphProto) :
-    """
-    If some resize layer has size defined instead of scale,
-    change to scale accordingly
-    ------------------------------------------------------
-    Assumes that the inputs are in following order
-    [Variable Input, roi, scales, sizes]
-    """
-    tensors = graph.tensors()
-    for node in graph.nodes:
-        # check if satisfy criteria
-        if node.op == "Resize":
-            # if not 4 inputs, do not consider
-            if len(node.inputs) != 4:
-                continue
-            var, roi, scales, sizes = node.inputs[0], node.inputs[1], node.inputs[2], node.inputs[3]
-            # if sizes is not empty and scales are empty and both are constant
-            if (not np.any(scales.shape)) and np.any(sizes.shape) \
-                and isinstance(sizes, gs.Constant):
-                reshaped_sizes = np.array(tensors[sizes.name].values, dtype=np.float32)
-                in_sizes = np.array(var.shape, dtype=np.float32)
-                scale_params = reshaped_sizes/in_sizes
 
-                # check scale parameter values
-                for t in scale_params:
-                    if np.log2(t) != int(np.log2(t)):
-                        logging.warning(f"{node.name} has scale not as power of "
-                                        f"2 which is not supported by TIDL")
-                scale_name = f"{node.name}.scales"
-                scales_updated = gs.Constant(name=scale_name, values=scale_params)
-                node.inputs = [var, roi, scales_updated]
-                logging.debug(f"Updating resize node {node.name} inputs from "
-                              f"sizes to scale {scale_params}")
-            # endif
-        # endif
-    # endfor
+def tidl_convert_batchnorm_input_to_4D (graph: gs.Graph, onnx_graph: onnx.GraphProto):
+    """
+    Only 4D batchnorm (NCHW) with batchnorm on the channel is supported
+    """
+
+    nodes = graph.nodes
+
+    for node in nodes:
+        if node.op == "BatchNormalization":
+            inp = node.inputs[0]
+            dim  = list(inp.shape)
+            # Check if less than 4D
+            if len(dim) < 4:
+                # add reshape with 1's appended at the end
+                num_ones = 4 - len(dim)
+                new_shape = np.array(dim + [1]*num_ones, dtype= np.int64)
+
+                reshp_shape = gs.Constant(name= f"{inp.name}_Reshape_4D_shape",
+                              values= new_shape)
+                reshp_out = gs.Variable(name= f"{inp.name}_Reshape_4D_out", dtype= np.float32)
+                reshp = gs.Node(name= f"{inp.name}_Reshape_4D", op= "Reshape",
+                                inputs= [inp, reshp_shape], outputs= [reshp_out])
+
+                logging.debug(f"Adding Reshape node {reshp.name} to convert input to shape {tuple(new_shape)}")
+                graph.nodes.append(reshp)
+
+                # change input to batchnorm
+                node.inputs[0] = reshp_out
+
+                # redirected output
+                bn_out = gs.Variable(name= f"{node.name}_Reshape_4D_out", dtype= np.float32)
+
+                # add reshape to convert back to original
+                original_shape = np.array(dim, dtype= np.int64)
+                reshp_shape = gs.Constant(name= f"{node.name}_Reshape_Original_shape",
+                              values= original_shape)
+                reshp_out = gs.Variable(name= f"{node.name}_Reshape_Original_out", dtype= np.float32)
+                reshp = gs.Node(name= f"{inp.name}_Reshape_Original", op= "Reshape",
+                                inputs= [bn_out, reshp_shape], outputs= node.outputs)
+
+                logging.debug(f"Adding Reshape node {reshp.name} to convert input to shape {tuple(original_shape)}")
+                graph.nodes.append(reshp)
+
+                # change output of bn
+                node.outputs = [bn_out]

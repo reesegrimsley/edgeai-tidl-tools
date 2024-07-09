@@ -65,7 +65,7 @@ contents are likely to change drastically in future. It is
 advised not to make modifications in this file as
 this may not give expected result.
 """
-
+import logging
 import onnx_graphsurgeon as gs
 import onnx
 from .common import find_out_layers
@@ -80,6 +80,7 @@ def tidl_modify_batch_dim (graph: gs.Graph, onnx_graph: onnx.GraphProto):
     """
     duplicate_for_multi_batch(graph, START_NODE_NAME, END_NODE_NAME)
     split_batched_inputs(graph)
+
 
 def add_node(graph:gs.Graph, name:str,op:str, dtype, attrs, inputs, output_shapes=[]):
     node_outs = [gs.Variable(f"{name}_out_{i}", dtype=dtype,shape=out) for i,out in enumerate(output_shapes)]

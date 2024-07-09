@@ -71,7 +71,7 @@ from .common import remove_node
 
 
 
-def tidl_optimize_attention_blocks (graph: gs.Graph, onnx_graph: onnx.GraphProto):
+def tidl_optimize_attention (graph: gs.Graph, onnx_graph: onnx.GraphProto):
     """
     Wrapper function to re-arrange and optimize self-attention block for Transformers
     """
@@ -82,6 +82,7 @@ def tidl_optimize_attention_blocks (graph: gs.Graph, onnx_graph: onnx.GraphProto
     for idx, att in enumerate(attention_blocks):
         logging.debug("\n"+bordered(f"Attention Block {idx}"))
         att.optimize(graph)
+
 
 
 
@@ -796,7 +797,6 @@ def tidl_find_attention_block (graph: gs.Graph, onnx_graph: onnx.GraphProto) -> 
                     if (curr_layer is not None) and (curr_layer != nodes[0]) and \
                         (curr_layer.op == "Split" or curr_layer.op =="Transpose") :
                         # common ancestor found and this is some split layer
-                        print(curr_layer)
                         split_qkv = find_node_idx(curr_layer, graph)
                         att = DeitLikeAttention()
                         att.split_qkv = split_qkv

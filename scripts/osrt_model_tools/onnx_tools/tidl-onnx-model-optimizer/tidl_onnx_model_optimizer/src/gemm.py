@@ -1,4 +1,4 @@
-# Copyright (c) {2023 - 2024} Texas Instruments Incorporated
+# Copyright (c) {2024 - 2024} Texas Instruments Incorporated
 #
 # All rights reserved not granted herein.
 #
@@ -56,49 +56,78 @@
 # OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED
 # OF THE POSSIBILITY OF SUCH DAMAGE.
 """
-Module containing Resize layer specific functions and optimizations
+Module containing Gemm layer specific functions and optimizations
 """
-
 import logging
 import onnx_graphsurgeon as gs
 import onnx
 import numpy as np
 
 
-def tidl_convert_resize_params_size_to_scale(graph: gs.Graph,
-                                             onnx_graph: onnx.GraphProto) :
+def tidl_convert_gemm_to_matmul_and_add (graph: gs.Graph, onnx_graph: onnx.GraphProto):
     """
-    If some resize layer has size defined instead of scale,
-    change to scale accordingly
-    ------------------------------------------------------
-    Assumes that the inputs are in following order
-    [Variable Input, roi, scales, sizes]
+    Convert Gemm layer with constant B input to Matmul and
+    Gemm bias (if exists) to a following add layer
     """
-    tensors = graph.tensors()
-    for node in graph.nodes:
-        # check if satisfy criteria
-        if node.op == "Resize":
-            # if not 4 inputs, do not consider
-            if len(node.inputs) != 4:
-                continue
-            var, roi, scales, sizes = node.inputs[0], node.inputs[1], node.inputs[2], node.inputs[3]
-            # if sizes is not empty and scales are empty and both are constant
-            if (not np.any(scales.shape)) and np.any(sizes.shape) \
-                and isinstance(sizes, gs.Constant):
-                reshaped_sizes = np.array(tensors[sizes.name].values, dtype=np.float32)
-                in_sizes = np.array(var.shape, dtype=np.float32)
-                scale_params = reshaped_sizes/in_sizes
 
-                # check scale parameter values
-                for t in scale_params:
-                    if np.log2(t) != int(np.log2(t)):
-                        logging.warning(f"{node.name} has scale not as power of "
-                                        f"2 which is not supported by TIDL")
-                scale_name = f"{node.name}.scales"
-                scales_updated = gs.Constant(name=scale_name, values=scale_params)
-                node.inputs = [var, roi, scales_updated]
-                logging.debug(f"Updating resize node {node.name} inputs from "
-                              f"sizes to scale {scale_params}")
-            # endif
-        # endif
-    # endfor
+    nodes = graph.nodes
+    tensors = graph.tensors()
+
+    for node in nodes:
+        if node.op == "Gemm" and\
+        isinstance(node.inputs[1], gs.Constant):		# check if B is constant input
+            # check attributes
+            if 'alpha' in node.attrs.keys() and node.attrs['alpha'] != 1:
+                logging.critical(f"Gemm node {node.name} has unsupported alpha != 1, skipping change")
+                continue
+
+            if 'beta' in node.attrs.keys() and node.attrs['beta'] != 1:
+                logging.critical(f"Gemm node {node.name} has unsupported beta != 1, skipping change")
+                continue
+
+            is_tranposed = node.attrs['transB'] if 'transB' in node.attrs.keys() else 0
+
+
+
+            # extract weights and bias
+            weights = np.array(tensors[node.inputs[1].name].values, dtype=np.float32)
+            bias = None
+            if len(node.inputs) > 2:	# bias exists
+                bias = np.array(tensors[node.inputs[2].name].values, dtype=np.float32)
+
+            if is_tranposed:
+                # swap last two indices
+                weight_dim_indices = list(range(len(weights.shape)))
+                temp = weight_dim_indices[-1]
+                weight_dim_indices[-1] = weight_dim_indices[-2]
+                weight_dim_indices[-2] = temp
+
+                weights = np.transpose(weights, tuple(weight_dim_indices))
+                logging.debug(f"transB is set to True, tranposing weights with perm = {tuple(weight_dim_indices)}")
+
+            # add MatMul node
+            if bias is not None:
+                matmul_out = gs.Variable(name= f"{node.name}_MatMul_out", dtype= np.float32)
+            else:
+                matmul_out = node.outputs[0]
+
+            matmul_wts = gs.Constant(name= f"{node.name}_MatMul_weights", values=weights)
+            matmul = gs.Node(name= f"{node.name}_MatMul", op= "MatMul",
+                             inputs= [node.inputs[0], matmul_wts], outputs= [matmul_out])
+            logging.debug(f"Adding MatMul node {matmul.name} with weights from {node.name}")
+            graph.nodes.append(matmul)
+
+            # add Add if bias is not None
+            if bias is not None:
+                # create add
+                # add_out = gs.Variable(name= f"{node.name}_Bias_Add_out", dtype= np.float32)
+                add_out = node.outputs[0]
+                add_wts = gs.Constant(name= f"{node.name}_Bias_Add_constant", values= bias)
+                add = gs.Node(name= f"{node.name}_Bias_Add", op= "Add",
+                              inputs= [matmul_out, add_wts], outputs= [add_out])
+                logging.debug(f"Adding Add node {add.name} with bias from {node.name}")
+
+                graph.nodes.append(add)
+
+            # clear this node's output
+            node.outputs.clear()

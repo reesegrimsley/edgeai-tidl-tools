@@ -56,8 +56,9 @@
 # OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED
 # OF THE POSSIBILITY OF SUCH DAMAGE.
 """
-Module containing Resize layer specific functions and optimizations
+Module containing Gather layer specific functions and optimizations
 """
+
 
 import logging
 import onnx_graphsurgeon as gs
@@ -65,40 +66,56 @@ import onnx
 import numpy as np
 
 
-def tidl_convert_resize_params_size_to_scale(graph: gs.Graph,
-                                             onnx_graph: onnx.GraphProto) :
-    """
-    If some resize layer has size defined instead of scale,
-    change to scale accordingly
-    ------------------------------------------------------
-    Assumes that the inputs are in following order
-    [Variable Input, roi, scales, sizes]
-    """
-    tensors = graph.tensors()
-    for node in graph.nodes:
-        # check if satisfy criteria
-        if node.op == "Resize":
-            # if not 4 inputs, do not consider
-            if len(node.inputs) != 4:
-                continue
-            var, roi, scales, sizes = node.inputs[0], node.inputs[1], node.inputs[2], node.inputs[3]
-            # if sizes is not empty and scales are empty and both are constant
-            if (not np.any(scales.shape)) and np.any(sizes.shape) \
-                and isinstance(sizes, gs.Constant):
-                reshaped_sizes = np.array(tensors[sizes.name].values, dtype=np.float32)
-                in_sizes = np.array(var.shape, dtype=np.float32)
-                scale_params = reshaped_sizes/in_sizes
 
-                # check scale parameter values
-                for t in scale_params:
-                    if np.log2(t) != int(np.log2(t)):
-                        logging.warning(f"{node.name} has scale not as power of "
-                                        f"2 which is not supported by TIDL")
-                scale_name = f"{node.name}.scales"
-                scales_updated = gs.Constant(name=scale_name, values=scale_params)
-                node.inputs = [var, roi, scales_updated]
-                logging.debug(f"Updating resize node {node.name} inputs from "
-                              f"sizes to scale {scale_params}")
-            # endif
-        # endif
-    # endfor
+def tidl_convert_gather_with_single_index_to_slice(graph: gs.Graph, onnx_graph: onnx.GraphProto):
+    """
+    When Gather has single index = t, can be converted to
+    Slice [t, t+1] on the same axis
+    """
+    nodes = graph.nodes
+    tensors = graph.tensors()
+
+    for node in nodes:
+        if node.op == "Gather":
+            inp, idx = node.inputs[0], node.inputs[1]
+            # check if single index
+            gather_indices = np.array(tensors[idx.name].values, dtype= np.int64)
+            if len(gather_indices.shape) == 0:
+
+                axis = node.attrs['axis']
+                # add Slice
+                slice_out = gs.Variable(name= f"{node.name}_Slice_out", dtype= np.float32)
+                starts = np.reshape(gather_indices, (1,))
+                slice_starts = gs.Constant(name= f"{node.name}_Slice_starts",
+                                           values= starts)
+                ends = starts + 1
+                slice_ends = gs.Constant(name= f"{node.name}_Slice_ends",
+                                           values= ends)
+                slice_axes = gs.Constant(name= f"{node.name}_Slice_axes",
+                                           values= np.array([axis], dtype= np.int64))
+                slc = gs.Node(name= f"{node.name}_Slice", op= "Slice",
+                                inputs= [node.inputs[0], slice_starts, slice_ends, slice_axes],
+                                outputs= [slice_out])
+
+
+                logging.debug(f"Adding Slice {slc.name} with axes {slice_axes.values}, "
+                              f"starts {slice_starts.values} and ends {slice_ends.values}")
+                graph.nodes.append(slc)
+
+                # add reshape to fix extra singular dim from slice
+                new_shape = list(inp.shape)
+                new_shape = np.array(new_shape[:axis] + new_shape[axis + 1: ],
+                                     dtype= np.int64)
+                reshp_shape = gs.Constant(name= f"{node.name}_Reshape_shape",
+                                          values= new_shape)
+
+                reshp = gs.Node(name= f"{node.name}_Reshape", op= "Reshape",
+                                inputs= [slice_out, reshp_shape], outputs= node.outputs)
+
+                logging.debug(f"Adding Reshape {reshp.name} to reshape Sliced output to "
+                              f"{new_shape}")
+                graph.nodes.append(reshp)
+
+
+                # clear out original node outputs and remove
+                node.outputs.clear()

@@ -62,6 +62,20 @@ from typing import List
 import onnx_graphsurgeon as gs
 import onnx
 
+class UniqueIdGenerator:
+    """
+    Unique Id for making name uniques
+    """
+    def __init__(self):
+        self.id = 0
+
+    def get_id (self) -> int:
+        """return unique id"""
+        self.id += 1
+        return self.id
+
+id_generator = UniqueIdGenerator()
+
 def find_in_layers (curr_layer: gs.Node) -> List[gs.Node]:
     """
     Return all input nodes to a given node
@@ -164,7 +178,13 @@ def is_first_node(node: gs.Node) -> bool:
         return True
     return False
 
-
+def is_single_const_single_var_input(node: gs.Node):
+    """
+    Return true if the node has input 1 constant and 1 variable
+    """
+    return  (len(node.inputs) == 2 and \
+            (isinstance(node.inputs[0], gs.Variable) and isinstance(node.inputs[1], gs.Constant)) or \
+            (isinstance(node.inputs[1], gs.Variable) and isinstance(node.inputs[0], gs.Constant)))
 
 def bordered(text):
     """

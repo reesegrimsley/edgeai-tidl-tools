@@ -69,15 +69,9 @@ import onnx
 from onnx import shape_inference
 from onnxsim import simplify
 
-### custom imports
-from .src.resize import tidl_modify_resize
-from .src.attention import tidl_optimize_attention_blocks
-from .src.batch import tidl_modify_batch_dim
+from .ops import opt_ops, get_optimizers, get_topological_sorted_key_order
 
-
-### function definitions
-
-NUM_OPS = 3
+NUM_OPS = len(opt_ops)
 
 def tidl_modify (model_path: str, out_model_path: str, args: dict):
     """
@@ -103,28 +97,24 @@ def tidl_modify (model_path: str, out_model_path: str, args: dict):
     graph = gs.import_onnx(model)
 
 
-    curr_op = 0
-    # resize
-    curr_op += 1
-    logging.info(f"[{curr_op}/{NUM_OPS}] Resize optimizations")
-    tidl_modify_resize(graph, onnx_graph)
-    # batch
-    curr_op += 1
-    if args['batch'] == "enable":
-        logging.info(f"[{curr_op}/{NUM_OPS}] Batch optimizations: Enabled")
-        tidl_modify_batch_dim(graph, onnx_graph)
-    else:
-        logging.info(f"[{curr_op}/{NUM_OPS}] Batch optimizations: Disabled")
-    # transformer
-    curr_op += 1
-    if args['transformer'] == "enable":
-        logging.info(f"[{curr_op}/{NUM_OPS}] Transformer optimizations: Enabled")
-        tidl_optimize_attention_blocks(graph, onnx_graph)
-    else:
-        logging.info(f"[{curr_op}/{NUM_OPS}] Transformer optimizations: Disabled")
+    curr_op = 1
+    topo_sorted_keys = get_topological_sorted_key_order()
+    # logging.debug(topo_sorted_keys)
+    for key in topo_sorted_keys:
+        if args[key]:
+            logging.info(f"[{curr_op}/{NUM_OPS}] {key.capitalize()} optimization : Enabled")
+            func = opt_ops[key]
+            func(graph, onnx_graph)
+            # cleanup
+            graph.cleanup().toposort()
 
-    # cleanup
-    graph.cleanup().toposort()
+            temp_model = gs.export_onnx(graph)
+            temp_model = shape_inference.infer_shapes(temp_model, check_type= True, strict_mode= True)
+            graph = gs.import_onnx(temp_model)
+        else:
+            logging.info(f"[{curr_op}/{NUM_OPS}] {key.capitalize()} optimization : Disabled")
+        curr_op += 1
+
 
     # post processing simplification
     out_model = gs.export_onnx(graph)
@@ -155,6 +145,7 @@ def format_logger (log_level):
     red     = "\x1b[31;1m"
     reset   = "\x1b[0m"
     logging.addLevelName(logging.WARNING, yellow + logging.getLevelName(logging.WARNING) + reset)
+    logging.addLevelName(logging.CRITICAL, yellow + logging.getLevelName(logging.WARNING) + reset)
     logging.addLevelName(logging.ERROR, red + logging.getLevelName(logging.ERROR) + reset)
     # set log level
     if log_level == "info":
@@ -165,17 +156,6 @@ def format_logger (log_level):
         print(f"Unknown log level {log_level}")
 
 
-def get_optimizers():
-    """
-    Default optimizers option list
-    """
-    return {
-        'transformer'               : 'disable',
-        'batch'                     : 'disable',
-        'shape_inference_mode'      : 'all',
-        'simplify_mode'             : None,
-        'simplify_kwargs'           : None
-    }
 
 
 def optimize (model:str, out_model:str = None, verbose:bool= False, **kwargs):
@@ -188,10 +168,6 @@ def optimize (model:str, out_model:str = None, verbose:bool= False, **kwargs):
     out_model:              path to output ONNX model (optional).
                             If not given, saved in same place as the input model
                             with a default name (optimized_<input_model_name>)
-    transformer:            (enable/disable) flag to enable/disable transformer
-                            optimization (default: disable)
-    batch:                  (enable/disable) flag to enable/disable batch input
-                            specific optimizations (default: disable)
     shape_inference_mode:   (pre/post/all/None) flag to use onnx shape inference
                             [pre: run only before graph surgeon optimization,
                             post:run only after graph surgeon optimization,
@@ -201,7 +177,7 @@ def optimize (model:str, out_model:str = None, verbose:bool= False, **kwargs):
                             [pre : simplify only before graph surgeon
                             optimizations, post:simplify only after graph
                             surgeon optimization, all: both pre and post are
-                            enabled, None (default): both disabled]   
+                            enabled, None (default): both disabled]
      ---------------------------------------------------------------
     Output
     ---------------------------------------------------------------
@@ -227,4 +203,3 @@ def optimize (model:str, out_model:str = None, verbose:bool= False, **kwargs):
     # call main wrapper function
     tidl_modify(model_path= model, out_model_path= out_model_path, args= args)
     logging.info(f"Saved modified model at {out_model_path}")
-

@@ -1,4 +1,4 @@
-# Copyright (c) {2023 - 2024} Texas Instruments Incorporated
+# Copyright (c) {2024 - 2024} Texas Instruments Incorporated
 #
 # All rights reserved not granted herein.
 #
@@ -56,49 +56,57 @@
 # OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED
 # OF THE POSSIBILITY OF SUCH DAMAGE.
 """
-Module containing Resize layer specific functions and optimizations
+Module containing MaxPool layer specific functions and optimizations
 """
-
 import logging
+import copy
 import onnx_graphsurgeon as gs
 import onnx
 import numpy as np
 
 
-def tidl_convert_resize_params_size_to_scale(graph: gs.Graph,
-                                             onnx_graph: onnx.GraphProto) :
+def tidl_convert_maxpool_to_cascaded_maxpool(graph: gs.Graph, onnx_graph: onnx.GraphProto):
     """
-    If some resize layer has size defined instead of scale,
-    change to scale accordingly
-    ------------------------------------------------------
-    Assumes that the inputs are in following order
-    [Variable Input, roi, scales, sizes]
+    The MaxPool layer with large kernel (> 3x3) is replaced with
+    cascaded MaxPool layers wiht 3x3 kernel. Assume that the kernel size
+    is NxN where N is odd
     """
-    tensors = graph.tensors()
-    for node in graph.nodes:
-        # check if satisfy criteria
-        if node.op == "Resize":
-            # if not 4 inputs, do not consider
-            if len(node.inputs) != 4:
-                continue
-            var, roi, scales, sizes = node.inputs[0], node.inputs[1], node.inputs[2], node.inputs[3]
-            # if sizes is not empty and scales are empty and both are constant
-            if (not np.any(scales.shape)) and np.any(sizes.shape) \
-                and isinstance(sizes, gs.Constant):
-                reshaped_sizes = np.array(tensors[sizes.name].values, dtype=np.float32)
-                in_sizes = np.array(var.shape, dtype=np.float32)
-                scale_params = reshaped_sizes/in_sizes
+    max_pools = [node for node in graph.nodes if node.op == "MaxPool"]
 
-                # check scale parameter values
-                for t in scale_params:
-                    if np.log2(t) != int(np.log2(t)):
-                        logging.warning(f"{node.name} has scale not as power of "
-                                        f"2 which is not supported by TIDL")
-                scale_name = f"{node.name}.scales"
-                scales_updated = gs.Constant(name=scale_name, values=scale_params)
-                node.inputs = [var, roi, scales_updated]
-                logging.debug(f"Updating resize node {node.name} inputs from "
-                              f"sizes to scale {scale_params}")
-            # endif
-        # endif
-    # endfor
+    for maxpool in max_pools:
+        kernelsize = maxpool.attrs["kernel_shape"][0]
+
+        if (kernelsize > 3):
+            num_iter = (kernelsize - 1) // 2 - 1
+            assert num_iter > 0
+
+            maxpool.attrs["kernel_shape"] = [3,3]
+            maxpool.attrs["pads"]         = [1,1,1,1]
+            maxpool.attrs["strides"]      = [1,1]
+
+            # copy and save maxpool.outputs
+            saved_outputs = copy.copy(maxpool.outputs)
+
+            outputs = [gs.Variable(f"{saved_outputs[0].name}.0",
+                                   shape=maxpool.outputs[0].shape, dtype=np.float32)]
+            maxpool.outputs = outputs
+
+            # set inputs for the next maxpool to append
+            inputs = maxpool.outputs
+            for i in range(num_iter):
+                if i == num_iter-1:
+                    # For the last maxpool node, ouputs is set to saved_outputs
+                    new_maxpool = gs.Node(op="MaxPool", name=f"{maxpool.name}."+f"{i+1}",
+                                          attrs=maxpool.attrs, inputs=inputs,
+                                          outputs=saved_outputs)
+                else:
+                    outputs = [gs.Variable(f"{saved_outputs[0].name}."+f"{i+1}",
+                                           shape=maxpool.outputs[0].shape, dtype=np.float32)]
+                    new_maxpool = gs.Node(op="MaxPool", name=f"{maxpool.name}."+f"{i+1}",
+                                          attrs=maxpool.attrs, inputs=inputs,  outputs=outputs)
+
+                    # set inputs for the next maxpool to append
+                    inputs = new_maxpool.outputs
+
+                # Append to the graph
+                graph.nodes.append(new_maxpool)
